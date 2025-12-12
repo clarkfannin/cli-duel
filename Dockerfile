@@ -9,4 +9,4 @@ FROM alpine:latest
 WORKDIR /app
 COPY --from=builder /app/duel .
 EXPOSE 8080
-CMD ["./duel", "server"]
+CMD ["./duel", "host"]

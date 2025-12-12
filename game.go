@@ -387,16 +387,17 @@ func (g *Game) draw() {
 
 	// Sword slashes (drawn last so they appear on top)
 	slashDuration := 150 * time.Millisecond
-	swordStyle := tcell.StyleDefault.Foreground(tcell.ColorWhite)
 
-	// Local player sword slash
+	// Local player sword slash (matches player color)
 	if time.Since(g.attacking) < slashDuration {
-		g.drawSword(g.PlayerX, g.PlayerY, g.facing, swordStyle)
+		playerSwordStyle := tcell.StyleDefault.Foreground(g.playerColor)
+		g.drawSword(g.PlayerX, g.PlayerY, g.facing, playerSwordStyle)
 	}
 
-	// Enemy sword slash (only if connected)
+	// Enemy sword slash (matches enemy color)
 	if g.enemyConnected && time.Since(g.enemyAttack) < slashDuration {
-		g.drawSword(g.enemyX, g.enemyY, g.enemyFacing, swordStyle)
+		enemySwordStyle := tcell.StyleDefault.Foreground(g.enemyColor)
+		g.drawSword(g.enemyX, g.enemyY, g.enemyFacing, enemySwordStyle)
 	}
 
 	// HP display (centered horizontally)
