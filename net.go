@@ -68,14 +68,15 @@ func handlePlayer(p *Player) {
 	}()
 
 	// Initialize player state with proper position and HP
+	// Arena: left=1, top=3, right=78, bottom=23
 	mu.Lock()
 	if p.State.Player1 {
-		p.State.X = 2
-		p.State.Y = 10
+		p.State.X = 10       // left side of arena
+		p.State.Y = 12       // vertically centered
 		p.State.HP = 100
 	} else {
-		p.State.X = 50
-		p.State.Y = 10
+		p.State.X = 65       // right side of arena
+		p.State.Y = 12       // vertically centered
 		p.State.HP = 100
 	}
 

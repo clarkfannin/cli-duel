@@ -8,6 +8,14 @@ import (
 	"github.com/gdamore/tcell/v2"
 )
 
+// Arena dimensions
+const (
+	arenaLeft   = 1
+	arenaTop    = 3
+	arenaRight  = 78
+	arenaBottom = 23
+)
+
 type Game struct {
 	screen      tcell.Screen
 	PlayerX     int
@@ -20,6 +28,7 @@ type Game struct {
 	attacking   time.Time
 	lastMove    time.Time // for acceleration
 	lastMoveDir rune      // last movement direction
+	isLeft      bool      // which side this player is on
 
 	enemyX         int
 	enemyY         int
@@ -42,24 +51,25 @@ func NewGame(isLeft bool) *Game {
 		playerCol, enemyCol = enemyCol, playerCol
 	}
 	// Set initial enemy position and facing based on which side we're on
-	enemyX := 50 // enemy on right if we're on left
+	enemyX := 65 // enemy on right if we're on left
 	playerFacing := 'd' // face right if on left
 	enemyFacing := 'a'  // enemy faces left if on right
 	if !isLeft {
-		enemyX = 2           // enemy on left if we're on right
+		enemyX = 10          // enemy on left if we're on right
 		playerFacing = 'a'   // face left if on right
 		enemyFacing = 'd'    // enemy faces right if on left
 	}
 	return &Game{
 		screen:      s,
 		PlayerX:     0,  // will be set by server
-		PlayerY:     10, // temporary, will be set by server
+		PlayerY:     12, // temporary, will be set by server
 		hp:          100,
 		playerColor: playerCol,
 		enemyColor:  enemyCol,
 		facing:      rune(playerFacing),
+		isLeft:      isLeft,
 		enemyX:      enemyX,
-		enemyY:      10,
+		enemyY:      12,
 		enemyHP:     100,
 		enemyFacing: rune(enemyFacing),
 	}
@@ -305,8 +315,59 @@ func (g *Game) Run(inputChan <-chan rune, netChan <-chan RemoteState, sendState 
 	}
 }
 
+func (g *Game) drawArena() {
+	borderStyle := tcell.StyleDefault.Foreground(tcell.ColorDarkGray)
+	flagBlue := tcell.StyleDefault.Foreground(tcell.ColorBlue)
+	flagRed := tcell.StyleDefault.Foreground(tcell.ColorRed)
+
+	// Top border with flags
+	g.screen.SetContent(arenaLeft, arenaTop, '╔', nil, borderStyle)
+	g.screen.SetContent(arenaRight, arenaTop, '╗', nil, borderStyle)
+	for x := arenaLeft + 1; x < arenaRight; x++ {
+		g.screen.SetContent(x, arenaTop, '═', nil, borderStyle)
+	}
+
+	// Bottom border
+	g.screen.SetContent(arenaLeft, arenaBottom, '╚', nil, borderStyle)
+	g.screen.SetContent(arenaRight, arenaBottom, '╝', nil, borderStyle)
+	for x := arenaLeft + 1; x < arenaRight; x++ {
+		g.screen.SetContent(x, arenaBottom, '═', nil, borderStyle)
+	}
+
+	// Side borders
+	for y := arenaTop + 1; y < arenaBottom; y++ {
+		g.screen.SetContent(arenaLeft, y, '║', nil, borderStyle)
+		g.screen.SetContent(arenaRight, y, '║', nil, borderStyle)
+	}
+
+	// Blue flag on left side (top)
+	g.screen.SetContent(arenaLeft+2, arenaTop-1, '▄', nil, flagBlue)
+	g.screen.SetContent(arenaLeft+3, arenaTop-1, '▄', nil, flagBlue)
+	g.screen.SetContent(arenaLeft+2, arenaTop-2, '█', nil, flagBlue)
+	g.screen.SetContent(arenaLeft+3, arenaTop-2, '▀', nil, flagBlue)
+	g.screen.SetContent(arenaLeft+1, arenaTop-2, '│', nil, borderStyle)
+	g.screen.SetContent(arenaLeft+1, arenaTop-1, '│', nil, borderStyle)
+
+	// Red flag on right side (top)
+	g.screen.SetContent(arenaRight-3, arenaTop-1, '▄', nil, flagRed)
+	g.screen.SetContent(arenaRight-2, arenaTop-1, '▄', nil, flagRed)
+	g.screen.SetContent(arenaRight-3, arenaTop-2, '▀', nil, flagRed)
+	g.screen.SetContent(arenaRight-2, arenaTop-2, '█', nil, flagRed)
+	g.screen.SetContent(arenaRight-1, arenaTop-2, '│', nil, borderStyle)
+	g.screen.SetContent(arenaRight-1, arenaTop-1, '│', nil, borderStyle)
+
+	// Center line (subtle)
+	centerX := (arenaLeft + arenaRight) / 2
+	for y := arenaTop + 1; y < arenaBottom; y += 2 {
+		g.screen.SetContent(centerX, y, '·', nil, borderStyle)
+	}
+}
+
 func (g *Game) draw() {
 	g.screen.Clear()
+
+	// Draw arena first (background)
+	g.drawArena()
 
 	// local player - little knight facing their direction
 	style := tcell.StyleDefault.Foreground(g.playerColor)
@@ -338,20 +399,24 @@ func (g *Game) draw() {
 		g.drawSword(g.enemyX, g.enemyY, g.enemyFacing, swordStyle)
 	}
 
-	// HP display
-	localHP := fmt.Sprintf("Your HP: %d", g.hp)
+	// HP display (centered horizontally)
+	centerX := (arenaLeft + arenaRight) / 2
+	localHP := fmt.Sprintf("You: %d HP", g.hp)
+	startX := centerX - len(localHP)/2
 	for i, r := range localHP {
-		g.screen.SetContent(i, 0, r, nil, tcell.StyleDefault)
+		g.screen.SetContent(startX+i, 0, r, nil, tcell.StyleDefault.Foreground(g.playerColor))
 	}
 	if g.enemyConnected {
-		enemyHP := fmt.Sprintf("Enemy HP: %d", g.enemyHP)
+		enemyHP := fmt.Sprintf("Enemy: %d HP", g.enemyHP)
+		startX = centerX - len(enemyHP)/2
 		for i, r := range enemyHP {
-			g.screen.SetContent(i, 1, r, nil, tcell.StyleDefault)
+			g.screen.SetContent(startX+i, 1, r, nil, tcell.StyleDefault.Foreground(g.enemyColor))
 		}
 	} else {
 		msg := "Waiting for opponent..."
+		startX = centerX - len(msg)/2
 		for i, r := range msg {
-			g.screen.SetContent(i, 1, r, nil, tcell.StyleDefault)
+			g.screen.SetContent(startX+i, 1, r, nil, tcell.StyleDefault)
 		}
 	}
 
