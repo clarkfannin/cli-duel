@@ -2,7 +2,7 @@
 
 an online, sword-fighting duel in the terminal.
 
-<img src="./output.gif">
+<img src="./output.gif" alt="cli-duel" loop=infinite>
 
 ## Install
 
