@@ -1,2 +1,23 @@
+# macOS
 .DS_Store
+
+# Claude Code
 .claude/
+
+# Compiled binary
+duel
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
