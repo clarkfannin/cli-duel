@@ -249,6 +249,20 @@ func (g *Game) Run(inputChan <-chan rune, netChan <-chan RemoteState, sendState 
 				return
 			}
 
+			// Clamp to arena bounds (character is 2x2)
+			if g.PlayerX < arenaLeft+1 {
+				g.PlayerX = arenaLeft + 1
+			}
+			if g.PlayerX > arenaRight-2 {
+				g.PlayerX = arenaRight - 2
+			}
+			if g.PlayerY < arenaTop+1 {
+				g.PlayerY = arenaTop + 1
+			}
+			if g.PlayerY > arenaBottom-2 {
+				g.PlayerY = arenaBottom - 2
+			}
+
 			// If attacking, show sword slash and check for hit
 			if attacking {
 				g.attacking = time.Now()
