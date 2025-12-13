@@ -24,11 +24,10 @@ type Game struct {
 	lastHit     time.Time
 	hitFlash    time.Time
 	playerColor tcell.Color
-	facing      rune // last direction: 'w', 'a', 's', 'd'
-	attacking   time.Time
-	lastMove    time.Time // for acceleration
-	lastMoveDir rune      // last movement direction
-	isLeft      bool      // which side this player is on
+	facing     rune // last direction: 'w', 'a', 's', 'd'
+	attacking  time.Time
+	lastAttack time.Time // for attack cooldown
+	isLeft     bool      // which side this player is on
 
 	enemyX         int
 	enemyY         int
@@ -38,6 +37,8 @@ type Game struct {
 	enemyFacing    rune
 	enemyAttack    time.Time
 	enemyConnected bool
+
+	totalPlayers int
 }
 
 func NewGame(isLeft bool) *Game {
@@ -205,49 +206,92 @@ func (g *Game) drawCharacter(x, y int, facing rune, style tcell.Style) {
 	}
 }
 
-func (g *Game) Run(inputChan <-chan rune, netChan <-chan RemoteState, sendState func(RemoteState)) {
+func (g *Game) Run(netChan <-chan RemoteState, sendState func(RemoteState)) {
 	ticker := time.NewTicker(30 * time.Millisecond)
 	defer g.screen.Fini()
 	heartbeat := 150 * time.Millisecond
 	lastSend := time.Now()
 
+	// Track key states
+	keysHeld := make(map[rune]bool)
+	attackPressed := false
+	quitChan := make(chan bool)
+
+	// Use tcell's event polling for responsive input
+	go func() {
+		for {
+			ev := g.screen.PollEvent()
+			switch ev := ev.(type) {
+			case *tcell.EventKey:
+				var key rune
+				isPress := true
+
+				switch ev.Key() {
+				case tcell.KeyRune:
+					key = ev.Rune()
+				case tcell.KeyUp:
+					key = 'w'
+				case tcell.KeyDown:
+					key = 's'
+				case tcell.KeyLeft:
+					key = 'a'
+				case tcell.KeyRight:
+					key = 'd'
+				case tcell.KeyEscape, tcell.KeyCtrlC:
+					quitChan <- true
+					return
+				}
+
+				if key != 0 {
+					if key == ' ' && isPress {
+						attackPressed = true
+					} else {
+						keysHeld[key] = isPress
+					}
+				}
+			}
+		}
+	}()
+
+	attackCooldown := 300 * time.Millisecond
+
 	for {
 		select {
-		case r := <-inputChan:
-			attacking := r == ' '
+		case <-quitChan:
+			return
+
+		case <-ticker.C:
 			oldX, oldY, oldHP := g.PlayerX, g.PlayerY, g.hp
-
-			// Calculate step size based on acceleration
-			// If same direction pressed within 100ms, increase step
 			step := 1
-			if r == g.lastMoveDir && time.Since(g.lastMove) < 100*time.Millisecond {
-				step = 3
-			}
+			moved := false
 
-			switch r {
-			case 'w':
+			// Process held movement keys
+			if keysHeld['w'] {
 				g.PlayerY -= step
 				g.facing = 'w'
-				g.lastMoveDir = 'w'
-				g.lastMove = time.Now()
-			case 's':
+				moved = true
+			}
+			if keysHeld['s'] {
 				g.PlayerY += step
 				g.facing = 's'
-				g.lastMoveDir = 's'
-				g.lastMove = time.Now()
-			case 'a':
+				moved = true
+			}
+			if keysHeld['a'] {
 				g.PlayerX -= step
 				g.facing = 'a'
-				g.lastMoveDir = 'a'
-				g.lastMove = time.Now()
-			case 'd':
+				moved = true
+			}
+			if keysHeld['d'] {
 				g.PlayerX += step
 				g.facing = 'd'
-				g.lastMoveDir = 'd'
-				g.lastMove = time.Now()
-			case 'q':
-				return
+				moved = true
 			}
+
+			// Clear movement keys (require re-press)
+			keysHeld['w'] = false
+			keysHeld['s'] = false
+			keysHeld['a'] = false
+			keysHeld['d'] = false
 
 			// Clamp to arena bounds (character is 2x2)
 			if g.PlayerX < arenaLeft+1 {
@@ -263,15 +307,19 @@ func (g *Game) Run(inputChan <-chan rune, netChan <-chan RemoteState, sendState 
 				g.PlayerY = arenaBottom - 2
 			}
 
-			// If attacking, show sword slash and check for hit
-			if attacking {
+			// Handle attack with cooldown
+			attacking := false
+			if attackPressed && time.Since(g.lastAttack) >= attackCooldown {
+				attacking = true
 				g.attacking = time.Now()
+				g.lastAttack = time.Now()
 				if g.canHitEnemy() {
 					g.enemyHitFlash = time.Now()
 				}
 			}
+			attackPressed = false
 
-			if g.PlayerX != oldX || g.PlayerY != oldY || g.hp != oldHP || attacking {
+			if moved || g.PlayerX != oldX || g.PlayerY != oldY || g.hp != oldHP || attacking {
 				sendState(RemoteState{
 					X:      g.PlayerX,
 					Y:      g.PlayerY,
@@ -282,7 +330,31 @@ func (g *Game) Run(inputChan <-chan rune, netChan <-chan RemoteState, sendState 
 				lastSend = time.Now()
 			}
 
+			// Heartbeat
+			if time.Since(lastSend) > heartbeat {
+				sendState(RemoteState{
+					X:      g.PlayerX,
+					Y:      g.PlayerY,
+					HP:     g.hp,
+					Attack: false,
+					Facing: g.facing,
+				})
+				lastSend = time.Now()
+			}
+
+			g.draw()
+
 		case st := <-netChan:
+			// Handle player count updates
+			if st.TotalPlayers > 0 {
+				g.totalPlayers = st.TotalPlayers
+			}
+
+			// Skip if this is just a player count message
+			if st.X == 0 && st.Y == 0 && st.HP == 0 {
+				continue
+			}
+
 			g.enemyConnected = true
 			g.enemyX = st.X
 			g.enemyY = st.Y
@@ -311,20 +383,6 @@ func (g *Game) Run(inputChan <-chan rune, netChan <-chan RemoteState, sendState 
 					}
 				}
 			}
-
-		case <-ticker.C:
-			if time.Since(lastSend) > heartbeat {
-				sendState(RemoteState{
-					X:      g.PlayerX,
-					Y:      g.PlayerY,
-					HP:     g.hp,
-					Attack: false,
-					Facing: g.facing,
-				})
-				lastSend = time.Now()
-			}
-
-			g.draw()
 		}
 	}
 }
@@ -432,6 +490,15 @@ func (g *Game) draw() {
 		startX = centerX - len(msg)/2
 		for i, r := range msg {
 			g.screen.SetContent(startX+i, 1, r, nil, tcell.StyleDefault)
+		}
+	}
+
+	// Total players online (bottom right of terminal)
+	if g.totalPlayers > 0 {
+		w, h := g.screen.Size()
+		online := fmt.Sprintf("%d online", g.totalPlayers)
+		for i, r := range online {
+			g.screen.SetContent(w-len(online)+i, h-1, r, nil, tcell.StyleDefault.Foreground(tcell.ColorDarkGray))
 		}
 	}
 

@@ -1,22 +1,21 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"net/http"
-	"os"
 	"sync"
 
 	"github.com/gorilla/websocket"
 )
 
 type RemoteState struct {
-	X       int  `json:"x"`
-	Y       int  `json:"y"`
-	HP      int  `json:"hp"`
-	Attack  bool `json:"attack"`
-	Facing  rune `json:"facing"`
-	Player1 bool `json:"player1"`
+	X            int  `json:"x"`
+	Y            int  `json:"y"`
+	HP           int  `json:"hp"`
+	Attack       bool `json:"attack"`
+	Facing       rune `json:"facing"`
+	Player1      bool `json:"player1"`
+	TotalPlayers int  `json:"total_players,omitempty"`
 }
 
 var upgrader = websocket.Upgrader{
@@ -26,11 +25,20 @@ var upgrader = websocket.Upgrader{
 type Player struct {
 	Conn  *websocket.Conn
 	State RemoteState
+	Lobby *Lobby
+}
+
+type Lobby struct {
+	ID      int
+	Players [2]*Player
+	mu      sync.Mutex
 }
 
 var (
-	players []*Player
-	mu      sync.Mutex
+	lobbies      []*Lobby
+	lobbyMu      sync.Mutex
+	nextLobbyID  int
+	totalPlayers int
 )
 
 // SERVER
@@ -42,11 +50,51 @@ func StartServer() {
 			return
 		}
 		player := &Player{Conn: c}
-		mu.Lock()
-		player.State.Player1 = len(players) == 0
-		players = append(players, player)
-		mu.Unlock()
 
+		// Find or create a lobby
+		lobbyMu.Lock()
+		var lobby *Lobby
+		for _, l := range lobbies {
+			l.mu.Lock()
+			if l.Players[1] == nil {
+				// Found a waiting lobby
+				lobby = l
+				player.State.Player1 = false
+				lobby.Players[1] = player
+				player.Lobby = lobby
+				l.mu.Unlock()
+				break
+			}
+			l.mu.Unlock()
+		}
+
+		if lobby == nil {
+			// Create new lobby
+			lobby = &Lobby{ID: nextLobbyID}
+			nextLobbyID++
+			player.State.Player1 = true
+			lobby.Players[0] = player
+			player.Lobby = lobby
+			lobbies = append(lobbies, lobby)
+		}
+		totalPlayers++
+		lobbyMu.Unlock()
+
+		// Initialize player position before any broadcasts
+		if player.State.Player1 {
+			player.State.X = 10
+			player.State.Y = 12
+			player.State.HP = 100
+		} else {
+			player.State.X = 65
+			player.State.Y = 12
+			player.State.HP = 100
+		}
+		// Send initial state to the new player first
+		player.Conn.WriteJSON(player.State)
+
+		fmt.Printf("Player joined lobby %d (player1: %v) - %d online\n", lobby.ID, player.State.Player1, totalPlayers)
+		broadcastPlayerCount()
 		go handlePlayer(player)
 	})
 
@@ -55,45 +103,44 @@ func StartServer() {
 }
 
 func handlePlayer(p *Player) {
+	lobby := p.Lobby
+
 	defer func() {
 		p.Conn.Close()
-		mu.Lock()
-		for i, pl := range players {
-			if pl == p {
-				players = append(players[:i], players[i+1:]...)
-				break
-			}
+		lobby.mu.Lock()
+		// Remove player from lobby
+		if lobby.Players[0] == p {
+			lobby.Players[0] = nil
+		} else if lobby.Players[1] == p {
+			lobby.Players[1] = nil
 		}
-		mu.Unlock()
-	}()
-
-	// Initialize player state with proper position and HP
-	// Arena: left=1, top=3, right=78, bottom=23
-	mu.Lock()
-	if p.State.Player1 {
-		p.State.X = 10       // left side of arena
-		p.State.Y = 12       // vertically centered
-		p.State.HP = 100
-	} else {
-		p.State.X = 65       // right side of arena
-		p.State.Y = 12       // vertically centered
-		p.State.HP = 100
-	}
-
-	// Send initial role assignment
-	p.Conn.WriteJSON(p.State)
-
-	// If this is the second player, broadcast both states to both players
-	if len(players) == 2 {
-		for _, player := range players {
-			for _, other := range players {
-				if other != player {
-					player.Conn.WriteJSON(other.State)
+		// Clean up empty lobbies
+		if lobby.Players[0] == nil && lobby.Players[1] == nil {
+			lobbyMu.Lock()
+			for i, l := range lobbies {
+				if l == lobby {
+					lobbies = append(lobbies[:i], lobbies[i+1:]...)
+					break
 				}
 			}
+			lobbyMu.Unlock()
 		}
+		lobby.mu.Unlock()
+
+		lobbyMu.Lock()
+		totalPlayers--
+		fmt.Printf("Player left lobby %d - %d online\n", lobby.ID, totalPlayers)
+		lobbyMu.Unlock()
+		broadcastPlayerCount()
+	}()
+
+	// If both players are in the lobby, send each other's state
+	lobby.mu.Lock()
+	if lobby.Players[0] != nil && lobby.Players[1] != nil {
+		lobby.Players[0].Conn.WriteJSON(lobby.Players[1].State)
+		lobby.Players[1].Conn.WriteJSON(lobby.Players[0].State)
 	}
-	mu.Unlock()
+	lobby.mu.Unlock()
 
 	for {
 		var st RemoteState
@@ -107,24 +154,40 @@ func handlePlayer(p *Player) {
 		p.State.Attack = st.Attack
 		p.State.Facing = st.Facing
 
-		broadcastStates()
+		broadcastToLobby(lobby, p)
 
 		// Clear one-time flags after broadcast
 		p.State.Attack = false
 	}
 }
 
-func broadcastStates() {
-	mu.Lock()
-	defer mu.Unlock()
-	for _, p := range players {
-		for _, other := range players {
-			if other == p {
-				continue
-			}
-			p.Conn.WriteJSON(other.State)
+func broadcastToLobby(lobby *Lobby, sender *Player) {
+	lobby.mu.Lock()
+	defer lobby.mu.Unlock()
+	for _, p := range lobby.Players {
+		if p != nil && p != sender {
+			p.Conn.WriteJSON(sender.State)
 		}
 	}
+}
+
+func broadcastPlayerCount() {
+	lobbyMu.Lock()
+	count := totalPlayers
+	lobbyMu.Unlock()
+
+	msg := RemoteState{TotalPlayers: count}
+	lobbyMu.Lock()
+	for _, lobby := range lobbies {
+		lobby.mu.Lock()
+		for _, p := range lobby.Players {
+			if p != nil {
+				p.Conn.WriteJSON(msg)
+			}
+		}
+		lobby.mu.Unlock()
+	}
+	lobbyMu.Unlock()
 }
 
 // CLIENT
@@ -136,7 +199,6 @@ func StartClient(url string) {
 	}
 	defer c.Close()
 
-	inputChan := make(chan rune, 10)
 	netChan := make(chan RemoteState, 10)
 
 	// Wait for initial role assignment
@@ -165,15 +227,7 @@ func StartClient(url string) {
 		}
 	}()
 
-	go func() {
-		reader := bufio.NewReader(os.Stdin)
-		for {
-			r, _, _ := reader.ReadRune()
-			inputChan <- r
-		}
-	}()
-
-	game.Run(inputChan, netChan, func(st RemoteState) {
+	game.Run(netChan, func(st RemoteState) {
 		c.WriteJSON(st)
 	})
 }
