@@ -166,20 +166,18 @@ func (g *Game) drawSword(x, y int, facing rune, style tcell.Style) {
 	}
 }
 
-// Draw a 2x2 character sprite based on facing direction
+
 // Little knight/warrior that faces the direction they're moving
 func (g *Game) drawCharacter(x, y int, facing rune, style tcell.Style) {
 	switch facing {
 	case 'w': // facing up
-		// ^_^
-		// /|\
 		g.screen.SetContent(x, y, 'o', nil, style)
 		g.screen.SetContent(x+1, y, '^', nil, style)
 		g.screen.SetContent(x, y+1, '|', nil, style)
 		g.screen.SetContent(x+1, y+1, '\\', nil, style)
 	case 's': // facing down
-		// v_v
-		// /|\
+		// Vo
+		// /|
 		g.screen.SetContent(x, y, 'v', nil, style)
 		g.screen.SetContent(x+1, y, 'o', nil, style)
 		g.screen.SetContent(x, y+1, '/', nil, style)
@@ -206,7 +204,7 @@ func (g *Game) drawCharacter(x, y int, facing rune, style tcell.Style) {
 	}
 }
 
-func (g *Game) Run(netChan <-chan RemoteState, sendState func(RemoteState)) {
+func (g *Game) Run(netChan <-chan RemoteState, matchResultChan <-chan MatchResult, sendMsg func(interface{})) {
 	ticker := time.NewTicker(30 * time.Millisecond)
 	defer g.screen.Fini()
 	heartbeat := 150 * time.Millisecond
@@ -215,50 +213,84 @@ func (g *Game) Run(netChan <-chan RemoteState, sendState func(RemoteState)) {
 	// Track key states
 	keysHeld := make(map[rune]bool)
 	attackPressed := false
-	quitChan := make(chan bool)
+	stopInput := make(chan bool)
+
+	// Helper to send game state
+	sendState := func(st RemoteState) {
+		sendMsg(st)
+	}
+
+	// Channel for input events
+	inputChan := make(chan *tcell.EventKey, 10)
 
 	// Use tcell's event polling for responsive input
 	go func() {
 		for {
 			ev := g.screen.PollEvent()
+			if ev == nil {
+				return
+			}
+			select {
+			case <-stopInput:
+				return
+			default:
+			}
 			switch ev := ev.(type) {
 			case *tcell.EventKey:
-				var key rune
-				isPress := true
-
-				switch ev.Key() {
-				case tcell.KeyRune:
-					key = ev.Rune()
-				case tcell.KeyUp:
-					key = 'w'
-				case tcell.KeyDown:
-					key = 's'
-				case tcell.KeyLeft:
-					key = 'a'
-				case tcell.KeyRight:
-					key = 'd'
-				case tcell.KeyEscape, tcell.KeyCtrlC:
-					quitChan <- true
-					return
-				}
-
-				if key != 0 {
-					if key == ' ' && isPress {
-						attackPressed = true
-					} else {
-						keysHeld[key] = isPress
-					}
+				select {
+				case inputChan <- ev:
+				default:
 				}
 			}
 		}
 	}()
 
+	// Process input events
+	processGameInput := func(ev *tcell.EventKey) bool {
+		var key rune
+
+		switch ev.Key() {
+		case tcell.KeyRune:
+			r := ev.Rune()
+			// Normalize to lowercase for consistent handling
+			if r >= 'A' && r <= 'Z' {
+				r = r + 32 // convert to lowercase
+			}
+			if r == 'q' {
+				return true // quit
+			}
+			key = r
+		case tcell.KeyUp:
+			key = 'w'
+		case tcell.KeyDown:
+			key = 's'
+		case tcell.KeyLeft:
+			key = 'a'
+		case tcell.KeyRight:
+			key = 'd'
+		case tcell.KeyEscape, tcell.KeyCtrlC:
+			return true // quit
+		}
+
+		if key != 0 {
+			if key == ' ' {
+				attackPressed = true
+			} else {
+				keysHeld[key] = true
+			}
+		}
+		return false
+	}
+
 	attackCooldown := 300 * time.Millisecond
 
 	for {
 		select {
-		case <-quitChan:
-			return
+		case ev := <-inputChan:
+			if processGameInput(ev) {
+				close(stopInput)
+				return
+			}
 
 		case <-ticker.C:
 			oldX, oldY, oldHP := g.PlayerX, g.PlayerY, g.hp
@@ -381,6 +413,133 @@ func (g *Game) Run(netChan <-chan RemoteState, sendState func(RemoteState)) {
 						})
 						lastSend = time.Now()
 					}
+				}
+			}
+
+		case result := <-matchResultChan:
+			ticker.Stop()
+			g.showMatchResult(result, sendMsg, inputChan)
+			return
+		}
+	}
+}
+
+func (g *Game) showMatchResult(result MatchResult, sendMsg func(interface{}), inputChan <-chan *tcell.EventKey) {
+	g.screen.Clear()
+
+	centerX := (arenaLeft + arenaRight) / 2
+	centerY := (arenaTop + arenaBottom) / 2
+
+	// Format duration
+	seconds := float64(result.DurationMs) / 1000.0
+	timeStr := fmt.Sprintf("%.2fs", seconds)
+
+	if result.Won {
+		// Winner screen
+		msg := "YOU WIN!"
+		for i, r := range msg {
+			g.screen.SetContent(centerX-len(msg)/2+i, centerY-2, r, nil, tcell.StyleDefault.Foreground(tcell.ColorGreen).Bold(true))
+		}
+
+		timeMsg := fmt.Sprintf("Time: %s", timeStr)
+		for i, r := range timeMsg {
+			g.screen.SetContent(centerX-len(timeMsg)/2+i, centerY, r, nil, tcell.StyleDefault)
+		}
+
+		prompt := "Enter your name for the leaderboard:"
+		for i, r := range prompt {
+			g.screen.SetContent(centerX-len(prompt)/2+i, centerY+2, r, nil, tcell.StyleDefault)
+		}
+
+		g.screen.Show()
+
+		// Get player name input
+		name := g.getNameInput(centerX, centerY+4, inputChan)
+		if name != "" {
+			// Submit high score
+			sendMsg(HighScoreSubmit{
+				Type:       "highscore_submit",
+				PlayerName: name,
+				DurationMs: result.DurationMs,
+			})
+		}
+
+		// Show confirmation
+		g.screen.Clear()
+		if name != "" {
+			confirm := fmt.Sprintf("Score submitted: %s - %s", name, timeStr)
+			for i, r := range confirm {
+				g.screen.SetContent(centerX-len(confirm)/2+i, centerY, r, nil, tcell.StyleDefault.Foreground(tcell.ColorGreen))
+			}
+		} else {
+			confirm := "Score not submitted"
+			for i, r := range confirm {
+				g.screen.SetContent(centerX-len(confirm)/2+i, centerY, r, nil, tcell.StyleDefault)
+			}
+		}
+		g.screen.Show()
+		time.Sleep(2 * time.Second)
+	} else {
+		// Loser screen
+		msg := "YOU DIED"
+		for i, r := range msg {
+			g.screen.SetContent(centerX-len(msg)/2+i, centerY-1, r, nil, tcell.StyleDefault.Foreground(tcell.ColorRed).Bold(true))
+		}
+
+		timeMsg := fmt.Sprintf("Match duration: %s", timeStr)
+		for i, r := range timeMsg {
+			g.screen.SetContent(centerX-len(timeMsg)/2+i, centerY+1, r, nil, tcell.StyleDefault)
+		}
+
+		g.screen.Show()
+		time.Sleep(3 * time.Second)
+	}
+}
+
+func (g *Game) getNameInput(x, y int, inputChan <-chan *tcell.EventKey) string {
+	name := ""
+	maxLen := 12
+
+	// Draw loop with ticker for cursor blink
+	ticker := time.NewTicker(30 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Draw input field
+			inputField := name + "_"
+			for len(inputField) < maxLen+1 {
+				inputField += " "
+			}
+			for i, r := range inputField {
+				g.screen.SetContent(x-maxLen/2+i, y, r, nil, tcell.StyleDefault.Reverse(true))
+			}
+
+			hint := "(Enter to submit, Esc to skip)"
+			for i, r := range hint {
+				g.screen.SetContent(x-len(hint)/2+i, y+2, r, nil, tcell.StyleDefault.Foreground(tcell.ColorDarkGray))
+			}
+
+			g.screen.Show()
+
+		case ev := <-inputChan:
+			switch ev.Key() {
+			case tcell.KeyEnter:
+				if len(name) > 0 {
+					return name
+				}
+			case tcell.KeyEscape:
+				return ""
+			case tcell.KeyBackspace, tcell.KeyBackspace2:
+				if len(name) > 0 {
+					name = name[:len(name)-1]
+				}
+			case tcell.KeyRune:
+				r := ev.Rune()
+				// Only allow alphanumeric and some symbols
+				if len(name) < maxLen && (r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-') {
+					name += string(r)
 				}
 			}
 		}

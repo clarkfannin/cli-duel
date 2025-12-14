@@ -1,9 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -18,6 +25,24 @@ type RemoteState struct {
 	TotalPlayers int  `json:"total_players,omitempty"`
 }
 
+type MatchResult struct {
+	Type       string `json:"type"` // "match_result"
+	Won        bool   `json:"won"`
+	DurationMs int64  `json:"duration_ms"`
+}
+
+type HighScoreSubmit struct {
+	Type       string `json:"type"` // "highscore_submit"
+	PlayerName string `json:"player_name"`
+	DurationMs int64  `json:"duration_ms"`
+}
+
+type HighScore struct {
+	Rank       int    `json:"rank"`
+	PlayerName string `json:"player_name"`
+	DurationMs int64  `json:"duration_ms"`
+}
+
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
@@ -29,20 +54,125 @@ type Player struct {
 }
 
 type Lobby struct {
-	ID      int
-	Players [2]*Player
-	mu      sync.Mutex
+	ID         int
+	Players    [2]*Player
+	StartTime  time.Time
+	MatchEnded bool
+	mu         sync.Mutex
 }
 
 var (
-	lobbies      []*Lobby
-	lobbyMu      sync.Mutex
-	nextLobbyID  int
-	totalPlayers int
+	lobbies        []*Lobby
+	lobbyMu        sync.Mutex
+	nextLobbyID    int
+	totalPlayers   int
+	upstashURL     string
+	upstashToken   string
+	redisConnected bool
 )
+
+func initRedis() {
+	upstashURL = os.Getenv("UPSTASH_REDIS_REST_URL")
+	upstashToken = os.Getenv("UPSTASH_REDIS_REST_TOKEN")
+	if upstashURL == "" || upstashToken == "" {
+		fmt.Println("Warning: UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN not set, high scores disabled")
+		return
+	}
+	redisConnected = true
+	fmt.Println("Connected to Upstash Redis")
+}
+
+func upstashRequest(command []interface{}) (interface{}, error) {
+	if !redisConnected {
+		return nil, fmt.Errorf("redis not connected")
+	}
+	body, _ := json.Marshal(command)
+	req, _ := http.NewRequest("POST", upstashURL, bytes.NewBuffer(body))
+	req.Header.Set("Authorization", "Bearer "+upstashToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	var result struct {
+		Result interface{} `json:"result"`
+		Error  string      `json:"error"`
+	}
+	json.Unmarshal(respBody, &result)
+	if result.Error != "" {
+		return nil, fmt.Errorf(result.Error)
+	}
+	return result.Result, nil
+}
+
+func submitHighScore(playerName string, durationMs int64) error {
+	if !redisConnected {
+		return fmt.Errorf("redis not connected")
+	}
+	// Use sorted set with duration as score (lower is better)
+	// Member format: "playerName:timestamp" for uniqueness
+	member := fmt.Sprintf("%s:%d", playerName, time.Now().UnixNano())
+	_, err := upstashRequest([]interface{}{"ZADD", "highscores", durationMs, member})
+	return err
+}
+
+func getTopScores(limit int) ([]HighScore, error) {
+	if !redisConnected {
+		return nil, fmt.Errorf("redis not connected")
+	}
+	result, err := upstashRequest([]interface{}{"ZRANGE", "highscores", "0", strconv.Itoa(limit - 1), "WITHSCORES"})
+	if err != nil {
+		return nil, err
+	}
+
+	// Result is an array of [member, score, member, score, ...]
+	arr, ok := result.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected response format")
+	}
+
+	scores := make([]HighScore, 0)
+	for i := 0; i < len(arr); i += 2 {
+		member := arr[i].(string)
+		scoreStr := arr[i+1].(string)
+		score, _ := strconv.ParseInt(scoreStr, 10, 64)
+
+		// Parse "playerName:timestamp" format
+		parts := strings.Split(member, ":")
+		playerName := parts[0]
+		if len(parts) > 2 {
+			// Handle names with colons by rejoining all but last part
+			playerName = strings.Join(parts[:len(parts)-1], ":")
+		}
+		scores = append(scores, HighScore{
+			Rank:       len(scores) + 1,
+			PlayerName: playerName,
+			DurationMs: score,
+		})
+	}
+	return scores, nil
+}
 
 // SERVER
 func StartServer() {
+	initRedis()
+
+	// High scores API endpoint
+	http.HandleFunc("/highscores", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		scores, err := getTopScores(10)
+		if err != nil {
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(scores)
+	})
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		c, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
@@ -62,6 +192,7 @@ func StartServer() {
 				player.State.Player1 = false
 				lobby.Players[1] = player
 				player.Lobby = lobby
+				lobby.StartTime = time.Now() // Match begins when both players join
 				l.mu.Unlock()
 				break
 			}
@@ -143,11 +274,32 @@ func handlePlayer(p *Player) {
 	lobby.mu.Unlock()
 
 	for {
-		var st RemoteState
-		err := p.Conn.ReadJSON(&st)
+		// Read raw message to determine type
+		_, rawMsg, err := p.Conn.ReadMessage()
 		if err != nil {
 			return
 		}
+
+		// Check if it's a high score submission
+		var msgType struct {
+			Type string `json:"type"`
+		}
+		json.Unmarshal(rawMsg, &msgType)
+
+		if msgType.Type == "highscore_submit" {
+			var submit HighScoreSubmit
+			if json.Unmarshal(rawMsg, &submit) == nil {
+				handleHighScoreSubmit(submit.PlayerName, submit.DurationMs)
+			}
+			continue
+		}
+
+		// Otherwise treat as game state
+		var st RemoteState
+		if json.Unmarshal(rawMsg, &st) != nil {
+			continue
+		}
+
 		p.State.X = st.X
 		p.State.Y = st.Y
 		p.State.HP = st.HP
@@ -156,8 +308,55 @@ func handlePlayer(p *Player) {
 
 		broadcastToLobby(lobby, p)
 
+		// Detect win condition: this player's HP reached 0
+		lobby.mu.Lock()
+		if p.State.HP <= 0 && !lobby.MatchEnded && !lobby.StartTime.IsZero() {
+			lobby.MatchEnded = true
+			durationMs := time.Since(lobby.StartTime).Milliseconds()
+
+			// Find opponent (the winner)
+			var winner *Player
+			for _, player := range lobby.Players {
+				if player != nil && player != p {
+					winner = player
+					break
+				}
+			}
+
+			// Send match results to both players
+			if winner != nil {
+				// Winner gets the duration for high score submission
+				winner.Conn.WriteJSON(MatchResult{
+					Type:       "match_result",
+					Won:        true,
+					DurationMs: durationMs,
+				})
+				fmt.Printf("Match ended in lobby %d - duration: %dms\n", lobby.ID, durationMs)
+			}
+			// Loser just gets notified they lost
+			p.Conn.WriteJSON(MatchResult{
+				Type:       "match_result",
+				Won:        false,
+				DurationMs: durationMs,
+			})
+		}
+		lobby.mu.Unlock()
+
 		// Clear one-time flags after broadcast
 		p.State.Attack = false
+	}
+}
+
+// Handle high score submission from winner
+func handleHighScoreSubmit(playerName string, durationMs int64) {
+	if len(playerName) < 1 || len(playerName) > 12 {
+		return
+	}
+	err := submitHighScore(playerName, durationMs)
+	if err != nil {
+		fmt.Println("Failed to submit high score:", err)
+	} else {
+		fmt.Printf("High score submitted: %s - %dms\n", playerName, durationMs)
 	}
 }
 
@@ -200,6 +399,7 @@ func StartClient(url string) {
 	defer c.Close()
 
 	netChan := make(chan RemoteState, 10)
+	matchResultChan := make(chan MatchResult, 1)
 
 	// Wait for initial role assignment
 	var isLeft bool
@@ -218,16 +418,34 @@ func StartClient(url string) {
 
 	go func() {
 		for {
-			var st RemoteState
-			err := c.ReadJSON(&st)
+			_, rawMsg, err := c.ReadMessage()
 			if err != nil {
 				return
 			}
-			netChan <- st
+
+			// Check message type
+			var msgType struct {
+				Type string `json:"type"`
+			}
+			json.Unmarshal(rawMsg, &msgType)
+
+			if msgType.Type == "match_result" {
+				var result MatchResult
+				if json.Unmarshal(rawMsg, &result) == nil {
+					matchResultChan <- result
+				}
+				continue
+			}
+
+			// Otherwise it's a game state
+			var st RemoteState
+			if json.Unmarshal(rawMsg, &st) == nil {
+				netChan <- st
+			}
 		}
 	}()
 
-	game.Run(netChan, func(st RemoteState) {
-		c.WriteJSON(st)
+	game.Run(netChan, matchResultChan, func(msg interface{}) {
+		c.WriteJSON(msg)
 	})
 }
